@@ -212,9 +212,12 @@ class DefaultMobileMenuWidgetBuilder extends MobileMenuWidgetBuilder {
       final deviceInfo = await DeviceInfoPlugin().deviceInfo;
       if (deviceInfo is AndroidDeviceInfo) {
         // There is no straightforward way to determine if Android device is
-        // fast enough for background blur so we just enable it for Android 10+,
+        // fast enough for background blur so we enable it for Android 10+,
         // assumption being older devices usually not getting upgrades.
-        _enableBackgroundBlur = deviceInfo.version.sdkInt >= 29;
+        // We also exclude devices with low RAM, since it's unlikely that they
+        // have good GPUs.
+        _enableBackgroundBlur =
+            deviceInfo.version.sdkInt >= 29 && !deviceInfo.isLowRamDevice;
       } else {
         _enableBackgroundBlur = false;
       }
