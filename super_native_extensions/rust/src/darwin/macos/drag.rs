@@ -25,18 +25,14 @@ use super::{
 use core_foundation::base::CFRelease;
 use core_graphics::event::{CGEventField, CGEventType};
 
-use icrate::{
-    AppKit::{
-        NSApplication, NSDragOperation, NSDragOperationNone, NSDraggingContext, NSDraggingItem,
-        NSDraggingSession, NSEvent, NSEventPhaseCancelled, NSEventPhaseEnded, NSEventPhaseNone,
-        NSEventTypeKeyDown, NSEventTypeLeftMouseDown, NSEventTypeMouseMoved,
-        NSEventTypeRightMouseDown, NSView,
-    },
-    Foundation::{MainThreadMarker, NSArray, NSPoint, NSProcessInfo, NSRect},
-};
 use irondash_engine_context::EngineContext;
 use irondash_message_channel::Value;
 use irondash_run_loop::{platform::PollSession, RunLoop};
+use objc2_app_kit::{
+    NSApplication, NSDragOperation, NSDraggingContext, NSDraggingItem, NSDraggingSession, NSEvent,
+    NSEventPhase, NSEventType, NSView,
+};
+use objc2_foundation::{MainThreadMarker, NSArray, NSPoint, NSProcessInfo, NSRect};
 
 use objc2::{
     class,
@@ -69,7 +65,7 @@ pub struct PlatformDragContext {
     pub view: Id<NSView>,
     last_mouse_down_event: RefCell<Option<Id<NSEvent>>>,
     last_mouse_up_event: RefCell<Option<Id<NSEvent>>>,
-    last_momentum_event: RefCell<Option<Id<NSEvent>>>,
+    last_scroll_event: RefCell<Option<Id<NSEvent>>>,
     sessions: RefCell<HashMap<isize /* draggingSequenceNumber */, DragSession>>,
     main_thread_marker: MainThreadMarker,
 }
@@ -94,7 +90,7 @@ impl PlatformDragContext {
             view: unsafe { Id::cast(view) },
             last_mouse_down_event: RefCell::new(None),
             last_mouse_up_event: RefCell::new(None),
-            last_momentum_event: RefCell::new(None),
+            last_scroll_event: RefCell::new(None),
             sessions: RefCell::new(HashMap::new()),
             main_thread_marker: MainThreadMarker::new().unwrap(),
         })
@@ -106,22 +102,22 @@ impl PlatformDragContext {
         });
     }
 
-    unsafe fn finish_momentum_events(&self) {
-        let event = { self.last_momentum_event.borrow().as_ref().cloned() };
+    unsafe fn finish_scroll_events(&self) {
+        let event = { self.last_scroll_event.borrow().as_ref().cloned() };
         // Unfinished momentum events will cause pan gesture recognizer
         // stuck since Flutter 3.3
         if let Some(event) = event {
             let phase = event.phase();
-            if phase != NSEventPhaseNone
-                && phase != NSEventPhaseEnded
-                && phase != NSEventPhaseCancelled
+            if phase != NSEventPhase::None
+                && phase != NSEventPhase::Ended
+                && phase != NSEventPhase::Cancelled
             {
                 let event = event.CGEvent();
                 let event = CGEventCreateCopy(event);
                 CGEventSetIntegerValueField(
                     event, //
                     99,    // kCGScrollWheelEventScrollPhase
-                    NSEventPhaseEnded as i64,
+                    NSEventPhase::Ended.0 as i64,
                 );
 
                 let synthesized = NSEvent::withCGEvent(event);
@@ -136,13 +132,13 @@ impl PlatformDragContext {
     }
 
     pub unsafe fn synthesize_mouse_up_event(&self) {
-        self.finish_momentum_events();
+        self.finish_scroll_events();
 
         if let Some(event) = self.last_mouse_down_event.borrow().as_ref().cloned() {
             #[allow(non_upper_case_globals)]
             let opposite = match event.r#type() {
-                NSEventTypeLeftMouseDown => CGEventType::LeftMouseUp,
-                NSEventTypeRightMouseDown => CGEventType::RightMouseUp,
+                NSEventType::LeftMouseDown => CGEventType::LeftMouseUp,
+                NSEventType::RightMouseDown => CGEventType::RightMouseUp,
                 _ => return,
             };
 
@@ -251,8 +247,64 @@ impl PlatformDragContext {
         self.last_mouse_up_event.replace(Some(event));
     }
 
-    fn on_momentum_event(&self, event: Id<NSEvent>) {
-        self.last_momentum_event.replace(Some(event));
+    /// Returns false if the event should be discarded.
+    fn on_scroll_event(&self, event: Id<NSEvent>) -> bool {
+        let last_event = self.last_scroll_event.borrow().clone();
+
+        // println!(">> event {:?}", event);
+        // println!(">> last_event {:?}", last_event);
+
+        if let Some(last_event) = last_event.as_ref() {
+            // For unknown reasons after closing context menu cocoa sometimes sends events in past.
+            if unsafe { event.timestamp() } < unsafe { last_event.timestamp() } {
+                return false;
+            }
+        }
+
+        let event_phase = unsafe { event.phase() };
+        let last_event_phase = last_event
+            .map(|e| unsafe { e.phase() })
+            .unwrap_or(NSEventPhase::None);
+
+        // Flutter engine is very particular about the order of events. Anything deviating from
+        // the expected order will trigger an assertion. The issue here is that with context menu
+        // or drag & drop sometimes events are missing which leads to a crash on assertion on next
+        // event. In order to prevent that the event flow needs to be sanitized.
+        if (event_phase == NSEventPhase::Ended || event_phase == NSEventPhase::Cancelled)
+            && (last_event_phase == NSEventPhase::Ended
+                || last_event_phase == NSEventPhase::Cancelled
+                || last_event_phase == NSEventPhase::None)
+        {
+            // End or cancelled event should only follow phase may begin, began or changed.
+            return false;
+        }
+        if event_phase == NSEventPhase::Changed
+            && (last_event_phase == NSEventPhase::Ended
+                || last_event_phase == NSEventPhase::None
+                || last_event_phase == NSEventPhase::Cancelled)
+        {
+            // Missing event began. Instead of throwing it away synthesize event with phase began
+            // so that tne engine can process it.
+            unsafe {
+                let event = event.CGEvent();
+                let event = CGEventCreateCopy(event);
+                CGEventSetIntegerValueField(
+                    event, //
+                    99,    // kCGScrollWheelEventScrollPhase
+                    NSEventPhase::Began.0 as i64,
+                );
+                let synthesized = NSEvent::withCGEvent(event);
+                CFRelease(event as *mut _);
+
+                let window = self.view.window();
+                if let Some(window) = window {
+                    window.sendEvent(&synthesized);
+                }
+            }
+        }
+
+        self.last_scroll_event.replace(Some(event));
+        true
     }
 
     fn synthesize_mouse_move_if_needed(&self) {
@@ -279,7 +331,7 @@ impl PlatformDragContext {
             {
                 let location: NSPoint = window.convertPointFromScreen(location);
                 let event = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
-                    NSEventTypeMouseMoved, location, NSEvent::modifierFlags_class(), system_uptime(), 0, None, 0, 1, 0.0);
+                    NSEventType::MouseMoved, location, NSEvent::modifierFlags_class(), system_uptime(), 0, None, 0, 1, 0.0);
                 let event = event.unwrap();
                 window.sendEvent(&event);
             }
@@ -298,7 +350,7 @@ impl PlatformDragContext {
             match event {
                 Some(event) => {
                     const K_VKESCAPE: c_ushort = 0x35;
-                    event.r#type() == NSEventTypeKeyDown && event.keyCode() == K_VKESCAPE
+                    event.r#type() == NSEventType::KeyDown && event.keyCode() == K_VKESCAPE
                 }
                 None => false,
             }
@@ -347,7 +399,7 @@ impl PlatformDragContext {
     }
 
     pub fn should_delay_window_ordering(&self, event: &NSEvent) -> bool {
-        if unsafe { event.r#type() } == NSEventTypeLeftMouseDown {
+        if unsafe { event.r#type() } == NSEventType::LeftMouseDown {
             let location: NSPoint = unsafe { event.locationInWindow() };
             let location: NSPoint = self.view.convertPoint_fromView(location, None);
             if let Some(delegate) = self.delegate.upgrade() {
@@ -382,13 +434,13 @@ impl PlatformDragContext {
         let session = sessions.get(&dragging_sequence_number);
         match session {
             Some(sessions) => {
-                let mut res = NSDragOperationNone;
+                let mut res = NSDragOperation::None.0;
                 for operation in &sessions.configuration.allowed_operations {
-                    res |= operation.to_platform();
+                    res |= operation.to_platform().0;
                 }
-                res
+                NSDragOperation(res)
             }
-            None => NSDragOperationNone,
+            None => NSDragOperation::None,
         }
     }
 
@@ -476,14 +528,6 @@ fn prepare_flutter() {
         );
         class.add_method(sel!(scrollWheel:), scroll_wheel as extern "C" fn(_, _, _));
         class.add_method(
-            sel!(magnifyWithEvent:),
-            magnify_with_event as extern "C" fn(_, _, _),
-        );
-        class.add_method(
-            sel!(rotateWithEvent:),
-            rotate_with_event as extern "C" fn(_, _, _),
-        );
-        class.add_method(
             sel!(shouldDelayWindowOrderingForEvent:),
             should_delay_window_ordering as extern "C" fn(_, _, _) -> _,
         )
@@ -547,25 +591,11 @@ extern "C" fn right_mouse_up(this: &NSView, _sel: Sel, event: &NSEvent) {
 }
 
 extern "C" fn scroll_wheel(this: &NSView, _sel: Sel, event: &NSEvent) {
-    with_state(this, |state| state.on_momentum_event(event.retain()), || ());
+    if !with_state(this, |state| state.on_scroll_event(event.retain()), || true) {
+        return;
+    }
     unsafe {
         let _: () = msg_send![super(this, class!(NSView)), scrollWheel: event];
-    }
-}
-
-extern "C" fn magnify_with_event(this: &NSView, _sel: Sel, event: &NSEvent) {
-    with_state(this, |state| state.on_momentum_event(event.retain()), || ());
-
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), magnifyWithEvent: event];
-    }
-}
-
-extern "C" fn rotate_with_event(this: &NSView, _sel: Sel, event: &NSEvent) {
-    with_state(this, |state| state.on_momentum_event(event.retain()), || ());
-
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), rotateWithEvent: event];
     }
 }
 
@@ -578,7 +608,7 @@ extern "C" fn source_operation_mask_for_dragging_context(
     with_state(
         this,
         move |state| state.source_operation_mask_for_dragging_context(session, context),
-        || NSDragOperationNone,
+        || NSDragOperation::None,
     )
 }
 

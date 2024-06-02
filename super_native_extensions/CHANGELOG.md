@@ -1,3 +1,27 @@
+## 0.8.16
+
+ - **FIX**: detect drag cancelled on desktop while waiting for data (#377).
+ - **FIX**: use startDragAndDrop instead of startDrag on Android sdk24 and above (#372).
+
+## 0.8.15
+
+ - **FIX**: remove obsolete code (#364).
+
+## 0.8.14
+
+ - Bump "super_native_extensions" to `0.8.14`.
+
+## 0.8.13
+
+## 0.8.12
+
+ - Bump "super_native_extensions" to `0.8.12`.
+
+## 0.8.11
+
+ - **FIX**: ignore scroll event in web drag driver.
+ - **FIX**: ignore unknown pointer device kind (#344).
+
 ## 0.8.10
 
 ## 0.8.9

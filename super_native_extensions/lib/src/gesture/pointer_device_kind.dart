@@ -14,7 +14,14 @@ class PointerDeviceKindDetector {
   }
 
   void _handleGlobalPointerEvent(PointerEvent event) {
-    _current.value = event.kind;
+    if (event.kind == PointerDeviceKind.unknown) {
+      // Happens on Android during drag & drop.
+    } else if (defaultTargetPlatform != TargetPlatform.iOS) {
+      // on iOS even with mouse connected (i.e. through universal control)
+      // we still need mobile widgets because drag & drop and context menu is
+      // driven from iOS.
+      _current.value = event.kind;
+    }
   }
 
   static PointerDeviceKind _defaultDeviceKind() {
